@@ -34,15 +34,17 @@ async fn foo() {
 ## API
 
 ```rust
-pub trait AbortSafeFuture {
+pub trait AbortSafeFuture: AsyncDrop {
     type Output;
     fn poll(self: Pin<&mut ManuallyDrop<Self>>, cx: &mut Context<'_>) -> Poll<Self::Output>;
-    fn poll_cancel(self: Pin<&mut ManuallyDrop<Self>>, cx: &mut Context<'_>) -> Poll<()>;
+}
+
+pub trait AsyncDrop {
+    fn poll_drop(self: Pin<&mut ManuallyDrop<Self>>, cx: &mut Context<'_>) -> Poll<()>;
 }
 ```
 
-为了满足目标一，相比于std的Future，我们多提供了一个`poll_cancel`的方法，在需要中断的时候调用。如果不调用，就可能产生内存泄露（而非UB）。
-（有点类似于`AsyncDrop`要做的事情）。
+我们通过`AsyncDrop`来达成目标一，在Future完成或者需要中断的时候调用`poll_drop`来传播中断。
 
 而为了满足目标二，`poll_*`的参数是`self: Pin<&mut ManuallyDrop<Self>>`。
 这样我们除了不能随意移动`Self`，也不能随意析构`Self`。
