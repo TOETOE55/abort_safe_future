@@ -4,7 +4,7 @@ use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use pin_project::pin_project;
-use crate::future::AbortSafeFuture;
+use crate::future::{AbortSafeFuture, AsyncDrop};
 use crate::helpers::pin_manually_drop_as_mut;
 
 #[pin_project]
@@ -40,15 +40,17 @@ impl<Fut: Future> AbortSafeFuture for Compat<Fut> {
         let output = if let Some(fut) = this.inner.as_mut().as_pin_mut() {
             ready!(fut.poll(cx))
         } else {
-            panic!("Compat::poll called after completion or after cancel")
+            panic!("Compat::poll called after completion or after canceled")
         };
 
         // drop inner future
         this.inner.set(None);
         Poll::Ready(output)
     }
+}
 
-    fn poll_cancel(mut self: Pin<&mut ManuallyDrop<Self>>, _cx: &mut Context<'_>) -> Poll<()> {
+impl<Fut> AsyncDrop for Compat<Fut> {
+    fn poll_drop(mut self: Pin<&mut ManuallyDrop<Self>>, _cx: &mut Context<'_>) -> Poll<()> {
         let mut this = pin_manually_drop_as_mut(&mut self).project();
         // drop inner future
         this.inner.set(None);
@@ -57,7 +59,11 @@ impl<Fut: Future> AbortSafeFuture for Compat<Fut> {
 }
 
 #[pin_project]
-pub struct Then<Fut1, Fut2, F> {
+pub struct Then<Fut1, Fut2, F>
+where
+    Fut1: AbortSafeFuture,
+    Fut2: AbortSafeFuture,
+{
     #[pin]
     inner: ThenInner<Fut1, Fut2>,
     f: Option<F>,
@@ -65,17 +71,25 @@ pub struct Then<Fut1, Fut2, F> {
 
 
 #[pin_project(project = ThenProj)]
-enum ThenInner<Fut1, Fut2> {
-    Fut1(#[pin] ManuallyDrop<Fut1>),
-    Fut2(#[pin] ManuallyDrop<Fut2>),
+enum ThenInner<Fut1, Fut2>
+where
+    Fut1: AbortSafeFuture,
+    Fut2: AbortSafeFuture,
+{
+    Fut1(#[pin] ManuallyDrop<Fut1>, Option<Fut1::Output>),
+    Fut2(#[pin] ManuallyDrop<Fut2>, Option<Fut2::Output>),
     Done,
     Canceled,
 }
 
-impl<Fut1, Fut2, F> Then<Fut1, Fut2, F> {
+impl<Fut1, Fut2, F> Then<Fut1, Fut2, F>
+where
+    Fut1: AbortSafeFuture,
+    Fut2: AbortSafeFuture,
+{
     pub fn new(fut1: Fut1, f: F) -> Self {
         Self {
-            inner: ThenInner::Fut1(ManuallyDrop::new(fut1)),
+            inner: ThenInner::Fut1(ManuallyDrop::new(fut1), None),
             f: Some(f),
         }
     }
@@ -93,32 +107,57 @@ where
         let mut this = pin_manually_drop_as_mut(&mut self).project();
         let inner = this.inner.as_mut().project();
         match inner {
-            ThenProj::Fut1(fut1) => {
-                let output = ready!(fut1.poll(cx));
-                let f = this.f.take().unwrap();
-                this.inner.set(ThenInner::Fut2(ManuallyDrop::new(f(output))));
+            ThenProj::Fut1(fut1, tmp @ None) => {
+                *tmp = Some(ready!(fut1.poll(cx)));
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            ThenProj::Fut2(fut2) => {
-                let output = ready!(fut2.poll(cx));
+            ThenProj::Fut1(fut1, tmp @ Some(_)) => {
+                ready!(fut1.poll_drop(cx));
+                let f = this.f.take().expect("f was None, AndThen::poll may called after canceled");
+                let tmp = tmp.take().unwrap();
+                this.inner.set(ThenInner::Fut2(ManuallyDrop::new(f(tmp)), None));
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            ThenProj::Fut2(fut2, tmp @ None) => {
+                *tmp = Some(ready!(fut2.poll(cx)));
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            ThenProj::Fut2(fut2, output @ Some(_)) => {
+                ready!(fut2.poll_drop(cx));
+                let output = output.take().unwrap();
                 this.inner.set(ThenInner::Done);
                 Poll::Ready(output)
             }
             ThenProj::Done => panic!("AndThen::poll called after completion"),
-            ThenProj::Canceled => panic!("AndThen::poll called after cancel"),
+            ThenProj::Canceled => panic!("AndThen::poll called after canceled"),
         }
     }
 
-    fn poll_cancel(mut self: Pin<&mut ManuallyDrop<Self>>, cx: &mut Context<'_>) -> Poll<()> {
+
+}
+
+impl<Fut1, Fut2, F> AsyncDrop for Then<Fut1, Fut2, F>
+where
+    Fut1: AbortSafeFuture,
+    Fut2: AbortSafeFuture
+{
+    fn poll_drop(mut self: Pin<&mut ManuallyDrop<Self>>, cx: &mut Context<'_>) -> Poll<()> {
         let mut this = pin_manually_drop_as_mut(&mut self).project();
+        // drop `f`
+        let _ = this.f.take();
+
         let inner = this.inner.as_mut().project();
         match inner {
-            ThenProj::Fut1(fut1) => {
-                fut1.poll_cancel(cx)
+            ThenProj::Fut1(fut1, output) => {
+                let _ = output.take();
+                fut1.poll_drop(cx)
             }
-            ThenProj::Fut2(fut2) => {
-                fut2.poll_cancel(cx)
+            ThenProj::Fut2(fut2, output) => {
+                let _ = output.take();
+                fut2.poll_drop(cx)
             }
             ThenProj::Done => {
                 this.inner.set(ThenInner::Canceled);
